@@ -4,7 +4,7 @@ Focus Guard : Vision-LLM 융합 시청각 멀티모달 공부 감독 시스템
 [파이프라인]
  Camera ─▶ YOLO (휴대폰/책/노트북 탐지)
         └▶ MediaPipe Pose (손목·고개 방향·자세)
-             └▶ 규칙 기반 이벤트 판단 (휴대폰 사용 / 딴 곳 보기 / 졸음 / 자리 비움)
+             └▶ 규칙 기반 이벤트 판단 (휴대폰 사용 / 딴 곳 보기 / 졸음 / 자세 흐트러짐 / 자리 비움)
                   └▶ 상태 JSON + 현재 프레임 이미지 ─▶ Gemma (멀티모달)
                        └▶ Piper TTS "왜 집중 안 해?"  ─▶ 사용자 음성(Whisper STT) ─▶ Gemma 판단 ─▶ TTS
 
@@ -96,6 +96,8 @@ YAW_RATIO_TH = 0.35         # 코가 귀 중심에서 이만큼 벗어나면 옆
 EAR_VIS_DIFF_TH = 0.55      # 한쪽 귀만 보이면 고개 돌린 것
 HEAD_DOWN_RATIO_TH = 0.15   # (어깨중심y - 코y) / 어깨너비 가 이보다 작으면 고개 숙임
 HAND_BOX_MARGIN = 0.25      # 물체 bbox를 이 비율만큼 키워서 손목이 들어오면 "손에 듦"
+SHOULDER_TILT_TH = 12.0     # 어깨선이 이 각도(도) 이상 기울면 자세 흐트러짐
+HEAD_TILT_TH = 20.0         # 양 귀를 잇는 선이 이 각도(도) 이상 기울면 고개를 옆으로 꺾음 (턱 괴기 등)
 
 # COCO 클래스: 0 person, 63 laptop, 64 mouse, 66 keyboard, 67 cell phone, 73 book
 YOLO_CLASSES = [0, 63, 64, 66, 67, 73]
@@ -106,6 +108,7 @@ STATE_FOCUS = "FOCUS"
 STATE_PHONE = "PHONE"
 STATE_AWAY = "LOOKING_AWAY"
 STATE_DROWSY = "HEAD_DOWN"
+STATE_POSTURE = "BAD_POSTURE"
 STATE_ABSENT = "ABSENT"
 
 STATE_KO = {
@@ -113,6 +116,7 @@ STATE_KO = {
     STATE_PHONE: "휴대폰 사용",
     STATE_AWAY: "고개를 돌려 다른 곳을 보는 중",
     STATE_DROWSY: "공부 물건 없이 고개를 숙이고 있음 (졸음 의심)",
+    STATE_POSTURE: "어깨나 고개가 한쪽으로 기울어 자세가 흐트러짐",
     STATE_ABSENT: "자리에 사람이 없음",
 }
 STATE_COLOR = {
@@ -120,6 +124,7 @@ STATE_COLOR = {
     STATE_PHONE: (0, 0, 255),
     STATE_AWAY: (0, 165, 255),
     STATE_DROWSY: (255, 0, 200),
+    STATE_POSTURE: (0, 220, 220),
     STATE_ABSENT: (160, 160, 160),
 }
 
@@ -331,7 +336,7 @@ Instruction:
 상황 정보와 사용자의 대답을 보고 그 이유가 타당한지 판단하여 대답하시오.
 
 Constraint:
-타당한 이유(공부 관련 검색, 급한 연락, 잠깐의 휴식 등)면 짧게 인정하고 다시 공부하라고 격려하시오.
+타당한 이유(공부 관련 검색, 급한 연락, 몸이 아픔, 잠깐의 휴식 등)면 짧게 인정하고 다시 공부하라고 격려하시오.
 핑계라면 단호하지만 유머 있게 반박하고 다시 집중하라고 하시오.
 이모티콘과 특수문자를 쓰지 마시오.
 
@@ -369,6 +374,7 @@ FALLBACK_SCOLD = {
     STATE_PHONE: "휴대폰 내려놓으세요. 왜 공부 안 하고 휴대폰 보고 있어요?",
     STATE_AWAY: "어디 보고 있어요? 왜 화면에 집중을 안 하는 거예요?",
     STATE_DROWSY: "고개가 계속 숙여져 있네요. 왜 졸고 있어요? 일어나세요!",
+    STATE_POSTURE: "자세가 많이 흐트러졌어요. 왜 그렇게 삐딱하게 앉아 있어요?",
     STATE_ABSENT: "자리가 비어 있네요. 왜 공부하다 말고 사라졌어요?",
 }
 
@@ -438,7 +444,8 @@ def box_overlap(a, b):
 
 def analyze_pose(landmarks, w, h):
     """MediaPipe Pose 33 landmark → 손 위치, 고개 방향, 고개 숙임"""
-    info = {"hands": [], "yaw_ratio": 0.0, "looking_away": False, "head_down": False, "visible": True}
+    info = {"hands": [], "yaw_ratio": 0.0, "looking_away": False, "head_down": False,
+            "shoulder_tilt": 0.0, "head_tilt": 0.0, "bad_posture": False, "visible": True}
 
     def px(i):
         p = landmarks[i]
@@ -469,6 +476,14 @@ def analyze_pose(landmarks, w, h):
     if shoulder_w > 20 and vis(11) > 0.5 and vis(12) > 0.5:
         shoulder_mid_y = (l_sh[1] + r_sh[1]) / 2
         info["head_down"] = (shoulder_mid_y - nose[1]) / shoulder_w < HEAD_DOWN_RATIO_TH
+        # 자세 흐트러짐 ①: 어깨선 기울기
+        info["shoulder_tilt"] = float(np.degrees(np.arctan2(abs(l_sh[1] - r_sh[1]), shoulder_w)))
+
+    # 자세 흐트러짐 ②: 양 귀를 잇는 선의 기울기 (고개를 옆으로 꺾음, 턱 괴기)
+    if ear_dist > 1 and vis(7) > 0.5 and vis(8) > 0.5:
+        info["head_tilt"] = float(np.degrees(np.arctan2(abs(l_ear[1] - r_ear[1]), ear_dist)))
+
+    info["bad_posture"] = info["shoulder_tilt"] > SHOULDER_TILT_TH or info["head_tilt"] > HEAD_TILT_TH
 
     info["keypoints"] = {k: px(i) for k, i in
                          [("nose", 0), ("l_ear", 7), ("r_ear", 8), ("l_sh", 11),
@@ -477,7 +492,7 @@ def analyze_pose(landmarks, w, h):
 
 
 def decide_state(objects, pose_info):
-    """규칙 기반 상태 판단 (우선순위: 자리비움 > 휴대폰 > 딴곳 > 졸음 > 집중)"""
+    """규칙 기반 상태 판단 (우선순위: 자리비움 > 휴대폰 > 딴곳 > 졸음 > 자세 흐트러짐 > 집중)"""
     persons = [o for o in objects if o["class"] == "person"]
     person_present = bool(persons) or pose_info is not None
 
@@ -500,6 +515,8 @@ def decide_state(objects, pose_info):
         state = STATE_AWAY
     elif pose_info and pose_info["head_down"] and not (STUDY_OBJECTS & set(held)):
         state = STATE_DROWSY
+    elif pose_info and pose_info["bad_posture"]:
+        state = STATE_POSTURE
     else:
         state = STATE_FOCUS
 
@@ -672,6 +689,15 @@ def draw_overlay(frame, objects, held, pose_info, state, duration, session, assi
     if pose_info:
         for name, (x, y) in pose_info["keypoints"].items():
             cv2.circle(frame, (int(x), int(y)), 5, (0, 255, 255), -1)
+        kp = pose_info["keypoints"]
+        if "l_sh" in kp and "r_sh" in kp:
+            p1, p2 = tuple(map(int, kp["l_sh"])), tuple(map(int, kp["r_sh"]))
+            cv2.line(frame, p1, p2, STATE_COLOR[STATE_POSTURE] if pose_info["bad_posture"] else (0, 255, 255), 2)
+        # 임계값 튜닝용 수치 표시
+        cv2.putText(frame,
+                    f"yaw {pose_info['yaw_ratio']:+.2f}  shoulder {pose_info['shoulder_tilt']:.0f}deg  "
+                    f"head {pose_info['head_tilt']:.0f}deg",
+                    (12, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
 
     # 상단 패널
     cv2.rectangle(frame, (0, 0), (w, 70), (30, 30, 30), -1)
